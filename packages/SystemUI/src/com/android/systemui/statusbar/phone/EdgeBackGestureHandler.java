@@ -17,6 +17,8 @@ package com.android.systemui.statusbar.phone;
 
 import static android.view.Display.INVALID_DISPLAY;
 
+import static org.lineageos.internal.util.DeviceKeysConstants.Action;
+
 import android.app.ActivityManager;
 import android.content.ComponentName;
 import android.content.Context;
@@ -37,6 +39,7 @@ import android.os.SystemProperties;
 import android.provider.DeviceConfig;
 import android.util.DisplayMetrics;
 import android.util.Log;
+import android.util.MathUtils;
 import android.util.TypedValue;
 import android.view.ISystemGestureExclusionListener;
 import android.view.InputChannel;
@@ -73,6 +76,9 @@ import com.android.systemui.shared.tracing.ProtoTraceable;
 import com.android.systemui.tracing.ProtoTracer;
 import com.android.systemui.tracing.nano.EdgeBackGestureHandlerProto;
 import com.android.systemui.tracing.nano.SystemUiTraceProto;
+import com.android.systemui.tuner.TunerService;
+
+import lineageos.providers.LineageSettings;
 
 import java.io.PrintWriter;
 import java.util.ArrayDeque;
@@ -85,11 +91,15 @@ import java.util.concurrent.Executor;
  * Utility class to handle edge swipes for back gesture
  */
 public class EdgeBackGestureHandler extends CurrentUserTracker implements DisplayListener,
-        PluginListener<NavigationEdgeBackPlugin>, ProtoTraceable<SystemUiTraceProto> {
+        PluginListener<NavigationEdgeBackPlugin>, ProtoTraceable<SystemUiTraceProto>,
+        TunerService.Tunable {
 
     private static final String TAG = "EdgeBackGestureHandler";
     private static final int MAX_LONG_PRESS_TIMEOUT = SystemProperties.getInt(
             "gestures.back_timeout", 250);
+
+    private static final String KEY_EDGE_LONG_SWIPE_ACTION =
+            "lineagesystem:" + LineageSettings.System.KEY_EDGE_LONG_SWIPE_ACTION;
 
     private ISystemGestureExclusionListener mGestureExclusionListener =
             new ISystemGestureExclusionListener.Stub() {
@@ -191,6 +201,7 @@ public class EdgeBackGestureHandler extends CurrentUserTracker implements Displa
     private boolean mIsEnabled;
     private boolean mIsNavBarShownTransiently;
     private boolean mIsBackGestureAllowed;
+    private boolean mIsLongSwipeEnabled;
     private boolean mGestureBlockingActivityRunning;
 
     private InputMonitor mInputMonitor;
@@ -200,6 +211,7 @@ public class EdgeBackGestureHandler extends CurrentUserTracker implements Displa
     private int mLeftInset;
     private int mRightInset;
     private int mSysUiFlags;
+    private float mLongSwipeWidth;
 
     // For Tf-Lite model.
     private BackGestureTfClassifierProvider mBackGestureTfClassifierProvider;
@@ -219,9 +231,11 @@ public class EdgeBackGestureHandler extends CurrentUserTracker implements Displa
     private final NavigationEdgeBackPlugin.BackCallback mBackCallback =
             new NavigationEdgeBackPlugin.BackCallback() {
                 @Override
-                public void triggerBack() {
-                    sendEvent(KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_BACK);
-                    sendEvent(KeyEvent.ACTION_UP, KeyEvent.KEYCODE_BACK);
+                public void triggerBack(boolean isLongPress) {
+                    sendEvent(KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_BACK,
+                            isLongPress ? KeyEvent.FLAG_LONG_PRESS : 0);
+                    sendEvent(KeyEvent.ACTION_UP, KeyEvent.KEYCODE_BACK,
+                            isLongPress ? KeyEvent.FLAG_LONG_PRESS : 0);
 
                     mOverviewProxyService.notifyBackAction(true, (int) mDownPoint.x,
                             (int) mDownPoint.y, false /* isButton */, !mIsOnLeftEdge);
@@ -302,6 +316,9 @@ public class EdgeBackGestureHandler extends CurrentUserTracker implements Displa
         mMLEnableWidth = (int) TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_DIP, 12.0f, dm);
         if (mMLEnableWidth > mEdgeWidthRight) mMLEnableWidth = mEdgeWidthRight;
         if (mMLEnableWidth > mEdgeWidthLeft) mMLEnableWidth = mEdgeWidthLeft;
+
+        final TunerService tunerService = Dependency.get(TunerService.class);
+        tunerService.addTunable(this, KEY_EDGE_LONG_SWIPE_ACTION);
 
         // Reduce the default touch slop to ensure that we can intercept the gesture
         // before the app starts to react to it.
@@ -427,6 +444,7 @@ public class EdgeBackGestureHandler extends CurrentUserTracker implements Displa
             setEdgeBackPlugin(new NavigationBarEdgePanel(mContext));
             mPluginManager.addPluginListener(
                     this, NavigationEdgeBackPlugin.class, /*allowMultiple=*/ false);
+            updateLongSwipeWidth();
         }
         // Update the ML model resources.
         updateMLModelState();
@@ -721,6 +739,12 @@ public class EdgeBackGestureHandler extends CurrentUserTracker implements Displa
                 mStartingQuickstepRotation != rotation;
     }
 
+    private void updateLongSwipeWidth() {
+        if (mIsEnabled && mEdgeBackPlugin != null) {
+            mEdgeBackPlugin.setLongSwipeEnabled(mIsLongSwipeEnabled);
+        }
+    }
+
     @Override
     public void onDisplayAdded(int displayId) { }
 
@@ -743,13 +767,23 @@ public class EdgeBackGestureHandler extends CurrentUserTracker implements Displa
         if (mEdgeBackPlugin != null) {
             mEdgeBackPlugin.setDisplaySize(mDisplaySize);
         }
+        updateLongSwipeWidth();
     }
 
-    private void sendEvent(int action, int code) {
+    @Override
+    public void onTuningChanged(String key, String newValue) {
+        if (KEY_EDGE_LONG_SWIPE_ACTION.equals(key)) {
+            mIsLongSwipeEnabled = Action.fromIntSafe(TunerService.parseInteger(
+                    newValue, 0)) != Action.NOTHING;
+            updateLongSwipeWidth();
+        }
+    }
+
+    private void sendEvent(int action, int code, int flags) {
         long when = SystemClock.uptimeMillis();
         final KeyEvent ev = new KeyEvent(when, when, action, code, 0 /* repeat */,
                 0 /* metaState */, KeyCharacterMap.VIRTUAL_KEYBOARD, 0 /* scancode */,
-                KeyEvent.FLAG_FROM_SYSTEM | KeyEvent.FLAG_VIRTUAL_HARD_KEY,
+                flags | KeyEvent.FLAG_FROM_SYSTEM | KeyEvent.FLAG_VIRTUAL_HARD_KEY,
                 InputDevice.SOURCE_KEYBOARD);
 
         // Bubble controller will give us a valid display id if it should get the back event

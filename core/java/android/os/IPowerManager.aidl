@@ -101,5 +101,6 @@ interface IPowerManager
     boolean forceSuspend();
 
     // Lineage custom API
+    void setKeyboardVisibility(boolean visible);
     void wakeUpWithProximityCheck(long time, int reason, String details, String opPackageName);
 }
